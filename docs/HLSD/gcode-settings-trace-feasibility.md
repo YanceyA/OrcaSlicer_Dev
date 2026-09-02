@@ -387,8 +387,9 @@ Illustrative, not final:
 ;_TR N overhang: overlap=0.31 -> overhang_3_4_speed:25%@g ref=200 -> 50
 ```
 
-Elements: attribute letter; ordered steps of `key:value@source`; `@source` refers to a source
-table emitted once in the header (`;_TR_SRC v17 volume "Modifier 1" object "Bracket"`), so
+Elements: attribute letter; ordered steps of `key:value@source`; the last step's value is the
+final value the generator believes it emitted, which the parser checks against the G-code (see
+9.3); `@source` refers to a source table emitted once in the header (`;_TR_SRC v17 volume "Modifier 1" object "Bracket"`), so
 per-path records stay short. Geometry-driven inputs (overlap, loop length, layer time) are
 carried as plain numbers. Records are emitted only when the record text differs from the last
 one for that attribute, exactly like `;WIDTH:`. Within a region and role most paths share a
@@ -432,9 +433,11 @@ short record before the affected G1 only when the value changed by more than a d
 
 - `GCodeProcessor::process_tags`: parse `;_TR` into an interned record table
   (`std::vector<std::string>` or a small struct with key ids) and keep current per-attribute
-  record ids as sticky state. Add `uint32_t trace_id` to `MoveVertex`, or keep a separate
-  `std::vector<std::pair<line_id, trace_ref>>` in `GCodeProcessorResult` searched by the vertex's
-  `gcode_id`. The second avoids touching libvgcode and the vertex size.
+  record ids as sticky state. Store a separate `std::vector<std::pair<line_id, trace_ref>>` in
+  `GCodeProcessorResult`, searched by the vertex's `gcode_id`. Do not add a field to
+  `MoveVertex`: the side table avoids touching libvgcode and the per-move memory footprint
+  (see 9.1). The parser also records, per attribute, whether the final claimed value matched the
+  parsed one (see 9.3).
 - `GCodeViewer::SequentialView::Marker::render_position_window`: add a collapsible "Why" section
   listing, per attribute, the resolved steps. The result pointer is already available
   (`GCodeViewer.hpp:186`). Optionally raise the G-code window truncation limit when the trace
@@ -452,7 +455,134 @@ short record before the affected G1 only when the value changed by more than a d
 - With the option off: no records are built, no tags are emitted, `process_tags` never sees them.
   The only cost is one boolean check per hook.
 
-## 9. Cost estimates
+## 9. Maintainability, isolation and robustness
+
+This section is the development contract. The plan in section 8 touches roughly 40 one-line hook
+sites across about ten files plus four new files. The maintenance cost is not spread evenly; it
+sits in three places, and each has a specific containment.
+
+### 9.1 Where the risk is
+
+- **`GCode::_extrude`.** A thousand-line function in a ten-thousand-line file that upstream
+  changes constantly. A dozen hooks there are merge-conflict bait on every upstream sync. This is
+  the single largest ongoing cost of the feature.
+- **The post-processor contract.** Any future stage that rewrites feedrate, extrusion or fan
+  without emitting a record makes the trace lie silently. This is the "falls over when a feature
+  is added" failure mode, and it cannot be prevented by structure alone because the stages
+  exchange plain text.
+- **`MoveVertex` and libvgcode.** A new field on the per-move vertex costs memory across millions
+  of moves and touches a vendored library. The side table keyed by G-code line id avoids both.
+
+The dual tag spellings, the parser and the ImGui panel are low risk.
+
+### 9.2 Isolation: the static sink pattern
+
+The fork already isolates an optional pipeline feature this way. The slicing pipeline plugin is
+wired through a static hook function and a per-print active flag
+(`Print.hpp:919-922`, `Print.cpp:2276-2277`, `Print.hpp:1299-1302`): the core checks one boolean
+and one pointer before each call, and everything else lives outside the core. The trace follows
+the same shape:
+
+- One new module, `src/libslic3r/GCode/GCodeTrace.{hpp,cpp}`, owning record construction, the
+  source table, encoding, and the parser. Nothing outside it knows the record format.
+- `GCode` holds a `std::unique_ptr<GCodeTrace>` that is null unless the option is on. Every hook
+  is a guarded one-liner: `if (m_trace) m_trace->speed_step(key, value, source);`. With the
+  option off the only cost is that branch.
+- Post-processors receive the same sink by pointer at construction, null when off.
+- The parser writes to an optional `GCodeProcessorResult::settings_trace` member. No change to
+  `MoveVertex`, `PathVertex` or libvgcode; the viewer looks up by the vertex's `gcode_id`.
+- One render function in `GCodeViewer.cpp`. The provenance resolver is a stateless class beside
+  `PrintObjectRegions`, tested alone.
+- The option itself is a print-preset bool in `Print::steps_gcode`, default off, shown in Develop
+  mode beside Verbose G-code.
+
+A compile-time switch in `Technologies.hpp`, in the style of `ENABLE_ACTUAL_SPEED_DEBUG`, is
+possible but not recommended: it doubles the build variants that must stay green and adds `#if`
+noise for no gain over a null-pointer check.
+
+### 9.3 Robustness: self-validating records
+
+Every record carries the final value the generator believes it emitted for that attribute. The
+parser compares that against what it actually reads from the G-code: the feedrate on the G1, ΔE
+over length, the last fan command. When they disagree, the trace does not explain the value it
+cannot account for; it inserts an explicit step, "changed by an unrecorded stage: 96 → 80", and
+a test fails.
+
+This is the mechanism that keeps the feature honest as the codebase evolves. A new post-processor
+or a new modifier in the speed ladder that nobody instrumented produces a visible unexplained
+delta rather than a wrong explanation. The trace degrades to "incomplete", never to "incorrect".
+
+The parser must also be forward compatible: unknown attribute letters, unknown keys and unknown
+source kinds are kept as opaque strings and displayed verbatim, so a file written by a newer
+build still loads in an older one and vice versa.
+
+### 9.4 The post-processor contract, pinned by a test
+
+One Catch2 case in `tests/fff_print` slices a reference model with every text stage active
+(spiral vase, extrusion rate smoothing, layer-time slowdown, fan mover) and the trace on, and
+asserts two things:
+
+1. Records survive every stage: the count and order of `;_TR` lines before and after each stage
+   are consistent, and no stage strips or reorders them.
+2. Every feedrate or extrusion change a stage makes has a record naming that stage's key.
+
+A short contract note goes at the pipeline wiring point in `GCode::process_layers`, where anyone
+adding a stage will read it: *a stage that changes F, E or M106 must emit a trace record through
+the sink or the trace test fails.* At this commit the complete list of writers is: F by the
+generator, `PressureEqualizer`, `CoolingBuffer` and the `FanMover` line split; E by the generator,
+`SpiralVase` and the `PressureEqualizer` split; fan by `CoolingBuffer`, `FanMover`, and the wipe
+tower's raw commands.
+
+### 9.5 Portability of the format
+
+Records are plain comment lines. One spelling constant, defined like `Flush_Start_Tag`
+(`GCodeProcessor.hpp:471`) rather than added to both `Reserved_Tags` arrays. Keys are config
+option ids, which are already stable identifiers serialised into projects and into the G-code
+config block. Firmware and older OrcaSlicer builds ignore the lines. The result is a data product
+rather than a UI feature: any tool can read it, and the fork's Python post-process plugin step
+(`SlicingPipelineStepPlugin::psGCodePostProcess`, `Print.hpp:105-111`) could consume it to
+produce reports without touching C++.
+
+### 9.6 Rules for hooks in shared code
+
+- A hook is a single line placed at the end of an existing statement or block, never inside
+  reformatted code. Expect about 40 conflict-prone lines in total; a refactor of the speed ladder
+  into helper functions would create hundreds and is not worth it for this feature.
+- All logic lives in new files. The hook passes the key, the value and, where known, the source;
+  it never formats text.
+- Never re-implement a decision in an "explainer". A second copy of the speed ladder drifts from
+  the first and the trace becomes a lie with confidence. Instrumentation works only because it
+  observes the one real implementation.
+- The sequential-print pipeline copy (`GCode.cpp:4358-4451`) gets the same hooks as the parallel
+  one, and the contract test runs both.
+- Both `CoolingBuffer` and the generator must report the same layer identity in their records;
+  pick `layer.id()` and convert where the generator uses `m_layer_index`.
+
+## 10. Headless testing
+
+OrcaSlicer can be driven without a GUI in two ways, and both cover the trace end to end.
+
+**Command line.** The binary accepts a plate index to slice, an output directory, and preset
+JSON files via the load-settings and load-filaments options, and writes one `plate_N.gcode` per
+plate through the same export path the GUI uses (`src/OrcaSlicer.cpp:6318-6323`). Only thumbnail
+regeneration during 3MF export needs OpenGL, initialised through GLFW at `:6622`; G-code export
+alone needs no display. This is the right vehicle for the reference-model measurements in
+section 11 and for a scripted checklist that toggles settings and asserts records.
+
+**Catch2 suites.** The `fff_print` helper builds a `Print` from meshes and a config, processes it,
+exports G-code to a temp file and returns the text (`tests/fff_print/test_helpers.cpp:321-330`).
+`test_cooling.cpp` drives `CoolingBuffer` in isolation. `test_gcode_timing.cpp` runs
+`GCodeProcessor` over a temp file and inspects the result. So generator records, each
+post-processor's records, the parser and the round-trip invariant are all unit-testable with no
+GUI. The ImGui panel is the only part that is not, which is why it must stay a thin view over
+the parsed result.
+
+Suites are off by default. On Linux, build with the test flag of the root build script and run
+`ctest --test-dir build/tests`; see `tests/AGENTS.md` for the conventions a new test must follow.
+The dependency tree takes hours to build, so a CI cache of `deps/build` is worth setting up before
+the prototype phase.
+
+## 11. Cost estimates
 
 Memory and file size scale with the number of *changes*, not lines, under the sticky encoding.
 Numbers to measure in the spike on three reference models (a calibration cube, a 2-hour organic
@@ -469,16 +599,18 @@ part with overhangs, and a large 20-hour plate):
 If measurements show the per-path emission rate is too high on Arachne walls (many short
 variable-width paths), fall back to per-role records plus a "variable width" flag.
 
-## 10. Phasing
+## 12. Phasing
 
-**Phase 0 — Spike (1 to 2 days).** Emit a single hard-coded `;_TR S` record from `_extrude` on
-speed changes, parse it in `process_tags`, print it in the position window. Measure record rate
-and file growth on the three reference models. Confirm the records survive the pressure
-equalizer, cooling and fan mover on a model with all three enabled.
+**Phase 0 — Spike (1 to 2 days).** Create the `GCodeTrace` module with the null-sink wiring from
+9.2 and the option flag. Emit a single `;_TR S` record from `_extrude` on speed changes, parse it
+in `process_tags`, print it in the position window. Measure record rate and file growth on the
+three reference models using the command line (section 10). Confirm the records survive the
+pressure equalizer, cooling and fan mover on a model with all three enabled.
 
 **Phase 1 — MVP.** Speed, flow and width traces from the generator; cooling slowdown layer
-record; the "Why" section in the position window; the opt-in option; strip-on-export. Provenance
-at the coarse level only (global vs object vs modifier vs layer range) via the resolver in 5.3.
+record; self-validation in the parser (9.3); the post-processor contract test (9.4); the "Why"
+section in the position window; strip-on-export. Provenance at the coarse level only (global vs
+object vs modifier vs layer range) via the resolver in 5.3.
 
 **Phase 2.** Fan arbitration records from `CoolingBuffer`; acceleration and jerk; temperature;
 pressure equalizer and fan mover records; source names in the UI; the G-code window limit.
@@ -486,7 +618,7 @@ pressure equalizer and fan mover records; source names in the UI; the G-code win
 **Phase 3.** Grouping of unchanged runs; per-bead Arachne width detail; tier-2 attributes (PA,
 seam, z-hop, layer height); hover picking in the 3D view.
 
-## 11. Decisions to surface
+## 13. Decisions to surface
 
 1. **Where the trace lives in the exported file.** Strip by default and keep only for the preview,
    or keep it when the user asks. Keeping it makes the file self-describing for bug reports.
@@ -504,7 +636,7 @@ seam, z-hop, layer height); hover picking in the 3D view.
 7. **Upstream intent.** If the target is an upstream PR, keep the MVP to Option C with the
    side-index (no `MoveVertex` change) and no new fields on `ExtrusionPath`.
 
-## 12. Risks and open questions
+## 14. Risks and open questions
 
 - **Divergence between trace and truth.** The trace records what the generator decided; the file
   contains what post-processors did. Every post-processor that changes a traced attribute must
@@ -527,7 +659,7 @@ seam, z-hop, layer height); hover picking in the 3D view.
 - **Untested area.** Whether the G-code window is worth extending or the position window is
   enough can only be judged by using it; both are ImGui and cheap to iterate.
 
-## 13. Verification strategy for the prototype
+## 15. Verification strategy for the prototype
 
 - **Catch2, `tests/fff_print`.** Slice a cube with the option on and known settings; assert that
   the exported text contains the expected `;_TR S` record for outer walls, that enabling
@@ -537,12 +669,18 @@ seam, z-hop, layer height); hover picking in the 3D view.
   assert the per-line lookup; feed a layer through `CoolingBuffer` with a slow layer and assert a
   cooling record is emitted and existing marker stripping is unchanged.
 - **Round-trip invariant.** For a model with no post-processors active, the traced final speed
-  must equal `MoveVertex::feedrate` for every extrusion move.
+  must equal `MoveVertex::feedrate` for every extrusion move, and the parser must report zero
+  unexplained deltas.
+- **Post-processor contract test.** The test described in 9.4: all text stages active, records
+  survive every stage, and every feedrate or extrusion change a stage makes is named by a record.
+- **Command-line checklist.** A script that slices a reference 3MF headless with the option on,
+  toggling one setting per run, and greps the exported G-code for the expected record. This is
+  cheap to run in CI and needs no display (section 10).
 - **Manual.** Three reference models, before/after file size, preview load time, and a checklist
   of settings toggled one at a time (overhang speed, small perimeter, volumetric limit, layer
   time slowdown, bridge flow, modifier override) confirming each appears in the panel.
 
-## 14. Appendix: reference index
+## 16. Appendix: reference index
 
 Pipeline and tags: `GCode.cpp:4256-4352` (pipeline), `GCodeProcessor.cpp:59-103` (tag arrays),
 `:4126` (`process_tags`), `:7015-7050` (`store_move_vertex`), `GCodeProcessor.hpp:215-249`
